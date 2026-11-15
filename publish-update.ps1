@@ -143,14 +143,19 @@ try {
 		$nextVersion = '{0}.{1}.{2}' -f $manifestVersion.Major, $manifestVersion.Minor, ($manifestVersion.Build + 1)
 	}
 	$tag = "v$nextVersion"
-	$releaseCheck = & gh release view $tag --repo $repository 2>&1
-	$releaseCheckExitCode = $LASTEXITCODE
-	$releaseCheckText = ($releaseCheck | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-	if ($releaseCheckExitCode -eq 0) {
-		throw "GitHub release $tag already exists."
+	$releaseExists = $false
+	try {
+		$null = & gh release view $tag --repo $repository 2>&1
+		if ($LASTEXITCODE -eq 0) {
+			$releaseExists = $true
+		}
 	}
-	if ($releaseCheckText -notmatch '(?i)(HTTP\s+404|404\s+Not Found|release not found|could not find release|no release found)') {
-		throw "Could not verify whether GitHub release $tag exists (exit code: $releaseCheckExitCode). Check authentication or network access and try again.`n$releaseCheckText"
+	catch {
+		$releaseExists = $false
+	}
+
+	if ($releaseExists) {
+		throw "GitHub release $tag already exists."
 	}
 
 	$projectText = Get-Content -LiteralPath $projectPath -Raw
