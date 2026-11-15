@@ -107,66 +107,40 @@ try {
 	}
 
 	$projectVersion = [version]$versionNode
-	if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-		throw "Version manifest was not found: $manifestPath"
+	$manifestVersion = $projectVersion
+	if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+		try {
+			$manifestJson = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop
+			if ([string]::IsNullOrWhiteSpace($manifestJson)) {
+				throw 'The file is empty.'
+			}
+			$manifest = ConvertFrom-Json -InputObject $manifestJson -ErrorAction Stop
+		}
+		catch {
+			throw "Could not read a valid version manifest at '$manifestPath': $($_.Exception.Message)"
+		}
+		if ($null -eq $manifest -or $manifest -isnot [System.Management.Automation.PSCustomObject]) {
+			throw 'version.json must contain a JSON object.'
+		}
+
+		$manifestVersionProperty = $manifest.PSObject.Properties['version']
+		if ($null -eq $manifestVersionProperty) {
+			$manifestVersionProperty = $manifest.PSObject.Properties['latestVersion']
+		}
+		if ($null -ne $manifestVersionProperty -and -not [string]::IsNullOrWhiteSpace([string]$manifestVersionProperty.Value)) {
+			$manifestVersionText = [string]$manifestVersionProperty.Value
+			if ($manifestVersionText -notmatch '^\d+\.\d+\.\d+$') {
+				throw 'version.json "version" must be a valid three-part version (for example, 1.2.3).'
+			}
+			$manifestVersion = [version]$manifestVersionText
+		}
 	}
 
-	try {
-		$manifestJson = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop
-	}
-	catch {
-		throw "Could not read version.json at '$manifestPath': $($_.Exception.Message)"
-	}
-	if ([string]::IsNullOrWhiteSpace($manifestJson)) {
-		throw "version.json is empty: $manifestPath"
-	}
-
-	try {
-		$manifest = ConvertFrom-Json -InputObject $manifestJson -ErrorAction Stop
-	}
-	catch {
-		throw "version.json contains invalid JSON: $($_.Exception.Message)"
-	}
-	if ($null -eq $manifest -or $manifest -isnot [System.Management.Automation.PSCustomObject]) {
-		throw 'version.json must contain a JSON object.'
-	}
-
-	$manifestVersionProperty = $manifest.PSObject.Properties['version']
-	if ($null -eq $manifestVersionProperty -or [string]::IsNullOrWhiteSpace([string]$manifestVersionProperty.Value)) {
-		throw 'version.json must contain a non-empty "version" property.'
-	}
-	$manifestVersionText = [string]$manifestVersionProperty.Value
-	if ($manifestVersionText -notmatch '^\d+\.\d+\.\d+$') {
-		throw 'version.json "version" must be a valid three-part version (for example, 1.2.3).'
-	}
-
-	$downloadUrlProperty = $manifest.PSObject.Properties['downloadUrl']
-	$packageUrlProperty = $manifest.PSObject.Properties['packageUrl']
-	$manifestUrl = $null
-	if ($null -ne $downloadUrlProperty -and -not [string]::IsNullOrWhiteSpace([string]$downloadUrlProperty.Value)) {
-		$manifestUrl = [string]$downloadUrlProperty.Value
-	}
-	elseif ($null -ne $packageUrlProperty -and -not [string]::IsNullOrWhiteSpace([string]$packageUrlProperty.Value)) {
-		$manifestUrl = [string]$packageUrlProperty.Value
-	}
-	if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
-		throw 'version.json must contain a non-empty "downloadUrl" or "packageUrl" property.'
-	}
-	$parsedManifestUrl = $null
-	if (-not [Uri]::TryCreate($manifestUrl, [UriKind]::Absolute, [ref]$parsedManifestUrl) -or $parsedManifestUrl.Scheme -ne 'https') {
-		throw 'version.json "downloadUrl" or "packageUrl" must be an absolute HTTPS URL.'
-	}
-
-	$manifestVersion = [version]$manifestVersionText
-	if ($manifestVersion -lt $projectVersion) {
-		throw "version.json version ($manifestVersion) cannot be lower than project version ($projectVersion)."
-	}
-
-	if ($manifestVersion -gt $projectVersion) {
-		$nextVersion = $manifestVersion.ToString(3)
+	if ($projectVersion -gt $manifestVersion) {
+		$nextVersion = $projectVersion.ToString(3)
 	}
 	else {
-		$nextVersion = '{0}.{1}.{2}' -f $projectVersion.Major, $projectVersion.Minor, ($projectVersion.Build + 1)
+		$nextVersion = '{0}.{1}.{2}' -f $manifestVersion.Major, $manifestVersion.Minor, ($manifestVersion.Build + 1)
 	}
 	$tag = "v$nextVersion"
 	$releaseLookup = Invoke-NativeCommand -FilePath 'gh' -Arguments @('release', 'view', $tag, '--repo', $repository) -FailureMessage "Could not check whether GitHub release $tag exists." -AllowedExitCodes @(0, 1)
