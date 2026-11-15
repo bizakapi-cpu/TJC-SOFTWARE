@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -7,7 +7,7 @@
     <UseWPF>true</UseWPF>
     <AssemblyName>TJC Service Desk</AssemblyName>
     <Product>TJC Service Desk</Product>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <RootNamespace>TJCServiceDesk</RootNamespace>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
