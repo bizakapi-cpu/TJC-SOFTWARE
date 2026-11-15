@@ -7,7 +7,7 @@
     <UseWPF>true</UseWPF>
     <AssemblyName>TJC Service Desk</AssemblyName>
     <Product>TJC Service Desk</Product>
-    <Version>1.1.4</Version>
+    <Version>1.1.5</Version>
     <RootNamespace>TJCServiceDesk</RootNamespace>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
