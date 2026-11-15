@@ -143,12 +143,14 @@ try {
 		$nextVersion = '{0}.{1}.{2}' -f $manifestVersion.Major, $manifestVersion.Minor, ($manifestVersion.Build + 1)
 	}
 	$tag = "v$nextVersion"
-	$releaseLookup = Invoke-NativeCommand -FilePath 'gh' -Arguments @('release', 'view', $tag, '--repo', $repository) -FailureMessage "Could not check whether GitHub release $tag exists." -AllowedExitCodes @(0, 1)
-	if ($releaseLookup.ExitCode -eq 0) {
+	$releaseCheck = & gh release view $tag --repo $repository 2>&1
+	$releaseCheckExitCode = $LASTEXITCODE
+	$releaseCheckText = ($releaseCheck | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+	if ($releaseCheckExitCode -eq 0) {
 		throw "GitHub release $tag already exists."
 	}
-	if ($releaseLookup.Output -notmatch '(?i)(HTTP\s+404|404\s+Not Found|release not found|could not find release|no release found)') {
-		throw "GitHub did not confirm that release $tag is absent. Check authentication or network access and try again.`n$($releaseLookup.Output)"
+	if ($releaseCheckText -notmatch '(?i)(HTTP\s+404|404\s+Not Found|release not found|could not find release|no release found)') {
+		throw "Could not verify whether GitHub release $tag exists (exit code: $releaseCheckExitCode). Check authentication or network access and try again.`n$releaseCheckText"
 	}
 
 	$projectText = Get-Content -LiteralPath $projectPath -Raw
