@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 $toolDirectories = @(
     (Join-Path $env:ProgramFiles 'Git\cmd'),
     (Join-Path $env:ProgramFiles 'GitHub CLI'),
@@ -22,7 +23,35 @@ $manifestFile = 'version.json'
 $scriptFile = 'publish-update.ps1'
 $projectPath = Join-Path $PSScriptRoot $projectFile
 $manifestPath = Join-Path $PSScriptRoot $manifestFile
-$scriptPath = Join-Path $PSScriptRoot $scriptFile
+
+function Invoke-NativeCommand {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory = $true)][string]$FilePath,
+		[Parameter(Mandatory = $true)][string[]]$Arguments,
+		[Parameter(Mandatory = $true)][string]$FailureMessage,
+		[int[]]$AllowedExitCodes = @(0)
+	)
+
+	try {
+		$commandOutput = @(& $FilePath @Arguments 2>&1)
+		$exitCode = $LASTEXITCODE
+	}
+	catch {
+		throw "$FailureMessage`n$($_.Exception.Message)"
+	}
+
+	$outputText = ($commandOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+	if ($null -eq $exitCode -or $AllowedExitCodes -notcontains [int]$exitCode) {
+		$detail = if ([string]::IsNullOrWhiteSpace($outputText)) { '' } else { "`n$outputText" }
+		throw "$FailureMessage (exit code: $exitCode).$detail"
+	}
+
+	[pscustomobject]@{
+		ExitCode = [int]$exitCode
+		Output = $outputText
+	}
+}
 
 Push-Location $PSScriptRoot
 try {
@@ -30,30 +59,46 @@ try {
 	if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI (gh) was not found on PATH.' }
 	if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw '.NET SDK was not found on PATH.' }
 
-	$repositoryRoot = (& git rev-parse --show-toplevel 2>$null)
-	if ($LASTEXITCODE -ne 0 -or [IO.Path]::GetFullPath($repositoryRoot.Trim()) -ne [IO.Path]::GetFullPath($PSScriptRoot)) {
+	$repositoryRootResult = Invoke-NativeCommand -FilePath 'git' -Arguments @('rev-parse', '--show-toplevel') -FailureMessage 'Could not determine the Git repository root.'
+	$repositoryRoot = $repositoryRootResult.Output.Trim()
+	if ([string]::IsNullOrWhiteSpace($repositoryRoot)) {
+		throw 'Git returned an empty repository root. Run this script from a Git working tree at the project root.'
+	}
+	if ([IO.Path]::GetFullPath($repositoryRoot) -ne [IO.Path]::GetFullPath($PSScriptRoot)) {
 		throw 'Run this script from a Git working tree at the project root.'
 	}
 
-	$remoteUrl = (& git remote get-url origin 2>$null)
-	if ($LASTEXITCODE -ne 0 -or $remoteUrl -notmatch 'bizakapi-cpu/TJC-SOFTWARE(?:\.git)?$') {
+	$remoteUrlResult = Invoke-NativeCommand -FilePath 'git' -Arguments @('remote', 'get-url', 'origin') -FailureMessage "Could not read Git remote 'origin'."
+	$remoteUrl = $remoteUrlResult.Output.Trim()
+	if ([string]::IsNullOrWhiteSpace($remoteUrl) -or $remoteUrl -notmatch 'bizakapi-cpu/TJC-SOFTWARE(?:\.git)?$') {
 		throw "Git remote 'origin' must point to $repository."
 	}
 
-	$currentBranch = (& git branch --show-current).Trim()
-	if ($LASTEXITCODE -ne 0 -or $currentBranch -ne $branch) {
+	$branchResult = Invoke-NativeCommand -FilePath 'git' -Arguments @('branch', '--show-current') -FailureMessage 'Could not determine the current Git branch.'
+	$currentBranch = $branchResult.Output.Trim()
+	if ([string]::IsNullOrWhiteSpace($currentBranch)) {
+		throw 'Git returned an empty branch name. Check that a branch is checked out.'
+	}
+	if ($currentBranch -ne $branch) {
 		throw "Check out '$branch' before publishing a release."
 	}
 
-	& git diff --cached --quiet
-	if ($LASTEXITCODE -ne 0) { throw 'Commit or unstage existing staged changes before publishing; the script will not include them.' }
+	$stagedChangesResult = Invoke-NativeCommand -FilePath 'git' -Arguments @('diff', '--cached', '--quiet') -FailureMessage 'Could not inspect staged Git changes.' -AllowedExitCodes @(0, 1)
+	if ($stagedChangesResult.ExitCode -eq 1) {
+		throw 'Commit or unstage existing staged changes before publishing; the script will not include them.'
+	}
 
-	$workingTreeChanges = & git status --porcelain --untracked-files=all
-	if ($LASTEXITCODE -ne 0) { throw 'Could not inspect working-tree status.' }
-	if ($workingTreeChanges) { throw "Commit or revert all project changes before publishing so the release source matches the executable.`n$workingTreeChanges" }
+	$statusResult = Invoke-NativeCommand -FilePath 'git' -Arguments @('status', '--porcelain', '--untracked-files=all') -FailureMessage 'Could not inspect working-tree status.'
+	if (-not [string]::IsNullOrWhiteSpace($statusResult.Output)) {
+		throw "Commit or revert all project changes before publishing so the release source matches the executable.`n$($statusResult.Output)"
+	}
 
-	& gh auth status --hostname github.com
-	if ($LASTEXITCODE -ne 0) { throw 'Authenticate with GitHub CLI first by running: gh auth login' }
+	try {
+		$null = Invoke-NativeCommand -FilePath 'gh' -Arguments @('auth', 'status', '--hostname', 'github.com') -FailureMessage 'GitHub CLI authentication check failed.'
+	}
+	catch {
+		throw "Authenticate with GitHub CLI first by running: gh auth login`n$($_.Exception.Message)"
+	}
 
 	[xml]$project = Get-Content -LiteralPath $projectPath -Raw
 	$versionNode = $project.Project.PropertyGroup.Version | Select-Object -First 1
@@ -62,9 +107,57 @@ try {
 	}
 
 	$projectVersion = [version]$versionNode
-	$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-	if ([string]$manifest.version -notmatch '^\d+\.\d+\.\d+$') { throw 'version.json must contain a valid three-part version.' }
-	$manifestVersion = [version]$manifest.version
+	if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+		throw "Version manifest was not found: $manifestPath"
+	}
+
+	try {
+		$manifestJson = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop
+	}
+	catch {
+		throw "Could not read version.json at '$manifestPath': $($_.Exception.Message)"
+	}
+	if ([string]::IsNullOrWhiteSpace($manifestJson)) {
+		throw "version.json is empty: $manifestPath"
+	}
+
+	try {
+		$manifest = ConvertFrom-Json -InputObject $manifestJson -ErrorAction Stop
+	}
+	catch {
+		throw "version.json contains invalid JSON: $($_.Exception.Message)"
+	}
+	if ($null -eq $manifest -or $manifest -isnot [System.Management.Automation.PSCustomObject]) {
+		throw 'version.json must contain a JSON object.'
+	}
+
+	$manifestVersionProperty = $manifest.PSObject.Properties['version']
+	if ($null -eq $manifestVersionProperty -or [string]::IsNullOrWhiteSpace([string]$manifestVersionProperty.Value)) {
+		throw 'version.json must contain a non-empty "version" property.'
+	}
+	$manifestVersionText = [string]$manifestVersionProperty.Value
+	if ($manifestVersionText -notmatch '^\d+\.\d+\.\d+$') {
+		throw 'version.json "version" must be a valid three-part version (for example, 1.2.3).'
+	}
+
+	$downloadUrlProperty = $manifest.PSObject.Properties['downloadUrl']
+	$packageUrlProperty = $manifest.PSObject.Properties['packageUrl']
+	$manifestUrl = $null
+	if ($null -ne $downloadUrlProperty -and -not [string]::IsNullOrWhiteSpace([string]$downloadUrlProperty.Value)) {
+		$manifestUrl = [string]$downloadUrlProperty.Value
+	}
+	elseif ($null -ne $packageUrlProperty -and -not [string]::IsNullOrWhiteSpace([string]$packageUrlProperty.Value)) {
+		$manifestUrl = [string]$packageUrlProperty.Value
+	}
+	if ([string]::IsNullOrWhiteSpace($manifestUrl)) {
+		throw 'version.json must contain a non-empty "downloadUrl" or "packageUrl" property.'
+	}
+	$parsedManifestUrl = $null
+	if (-not [Uri]::TryCreate($manifestUrl, [UriKind]::Absolute, [ref]$parsedManifestUrl) -or $parsedManifestUrl.Scheme -ne 'https') {
+		throw 'version.json "downloadUrl" or "packageUrl" must be an absolute HTTPS URL.'
+	}
+
+	$manifestVersion = [version]$manifestVersionText
 	if ($manifestVersion -lt $projectVersion) {
 		throw "version.json version ($manifestVersion) cannot be lower than project version ($projectVersion)."
 	}
@@ -76,6 +169,14 @@ try {
 		$nextVersion = '{0}.{1}.{2}' -f $projectVersion.Major, $projectVersion.Minor, ($projectVersion.Build + 1)
 	}
 	$tag = "v$nextVersion"
+	$releaseLookup = Invoke-NativeCommand -FilePath 'gh' -Arguments @('release', 'view', $tag, '--repo', $repository) -FailureMessage "Could not check whether GitHub release $tag exists." -AllowedExitCodes @(0, 1)
+	if ($releaseLookup.ExitCode -eq 0) {
+		throw "GitHub release $tag already exists."
+	}
+	if ($releaseLookup.Output -notmatch '(?i)(HTTP\s+404|404\s+Not Found|release not found|could not find release|no release found)') {
+		throw "GitHub did not confirm that release $tag is absent. Check authentication or network access and try again.`n$($releaseLookup.Output)"
+	}
+
 	$projectText = Get-Content -LiteralPath $projectPath -Raw
 	$versionPattern = '<Version>[^<]+</Version>'
 	if ($projectText -notmatch $versionPattern) { throw 'Could not locate <Version> in the project file.' }
@@ -84,8 +185,7 @@ try {
 
 	$publishDirectory = Join-Path ([IO.Path]::GetTempPath()) "TJCServiceDesk-publish-$([guid]::NewGuid().ToString('N'))"
 	try {
-		& dotnet publish $projectPath -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o $publishDirectory
-		if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed.' }
+		$null = Invoke-NativeCommand -FilePath 'dotnet' -Arguments @('publish', $projectPath, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishSingleFile=true', '-o', $publishDirectory) -FailureMessage 'dotnet publish failed.'
 
 		$publishedExecutable = Join-Path $publishDirectory 'TJC Service Desk.exe'
 		if (-not (Test-Path -LiteralPath $publishedExecutable -PathType Leaf)) {
@@ -94,17 +194,11 @@ try {
 		$releaseExecutable = Join-Path $publishDirectory 'TJC_Service_Desk.exe'
 		Move-Item -LiteralPath $publishedExecutable -Destination $releaseExecutable
 
-		& git add -- $projectFile $scriptFile
-		if ($LASTEXITCODE -ne 0) { throw 'Could not stage release source files.' }
-		& git commit -m "Prepare release $tag"
-		if ($LASTEXITCODE -ne 0) { throw 'Could not commit the version bump.' }
-		& git push origin $branch
-		if ($LASTEXITCODE -ne 0) { throw 'Could not push the version bump to GitHub.' }
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('add', '--', $projectFile, $scriptFile) -FailureMessage 'Could not stage release source files.'
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('commit', '-m', "Prepare release $tag") -FailureMessage 'Could not commit the version bump.'
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('push', 'origin', $branch) -FailureMessage 'Could not push the version bump to GitHub.'
 
-		& gh release view $tag --repo $repository *> $null
-		if ($LASTEXITCODE -eq 0) { throw "GitHub release $tag already exists." }
-		& gh release create $tag $releaseExecutable --repo $repository --title "TJC Service Desk $nextVersion" --notes $ReleaseNotes --target $branch
-		if ($LASTEXITCODE -ne 0) { throw "Could not create GitHub release $tag." }
+		$null = Invoke-NativeCommand -FilePath 'gh' -Arguments @('release', 'create', $tag, $releaseExecutable, '--repo', $repository, '--title', "TJC Service Desk $nextVersion", '--notes', $ReleaseNotes, '--target', $branch) -FailureMessage "Could not create GitHub release $tag."
 
 		$downloadUrl = "https://github.com/$repository/releases/download/$tag/TJC_Service_Desk.exe"
 		$updatedManifest = [ordered]@{
@@ -114,12 +208,9 @@ try {
 		} | ConvertTo-Json
 		[IO.File]::WriteAllText($manifestPath, "$updatedManifest`n", [Text.UTF8Encoding]::new($false))
 
-		& git add -- $manifestFile
-		if ($LASTEXITCODE -ne 0) { throw 'Could not stage version.json.' }
-		& git commit -m "Publish update manifest for $tag"
-		if ($LASTEXITCODE -ne 0) { throw 'Could not commit the updated version manifest.' }
-		& git push origin $branch
-		if ($LASTEXITCODE -ne 0) { throw 'Could not push version.json to GitHub.' }
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('add', '--', $manifestFile) -FailureMessage 'Could not stage version.json.'
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('commit', '-m', "Publish update manifest for $tag") -FailureMessage 'Could not commit the updated version manifest.'
+		$null = Invoke-NativeCommand -FilePath 'git' -Arguments @('push', 'origin', $branch) -FailureMessage 'Could not push version.json to GitHub.'
 
 		Write-Host "Published $tag. Update manifest now points to $downloadUrl"
 	}
