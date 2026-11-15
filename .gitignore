@@ -1,0 +1,10 @@
+.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+Properties/PublishProfiles/
+functions_placeholder
+*.db
+*.db-shm
+*.db-wal
